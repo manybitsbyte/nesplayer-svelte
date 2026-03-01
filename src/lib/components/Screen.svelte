@@ -3,6 +3,7 @@
 	import { SvelteSet } from 'svelte/reactivity';
 	import createNESPlayerModule from '$lib/wasm/nes-player.js';
 	import nesPlayerWasmUrl from '$lib/wasm/nes-player.wasm?url';
+	import ControllerPanel from './ControllerPanel.svelte';
 
 	interface NESModule {
 		HEAPU8:                Uint8Array;
@@ -79,15 +80,30 @@
 		}
 	`;
 
-	const KEY_MAP: Record<string, number> = {
-		KeyX:       0x01,
-		KeyZ:       0x02,
-		ShiftRight: 0x04,
-		Enter:      0x08,
+	const DEFAULT_GAMEPAD_BUTTON_MAP: Record<number, number> = {
+		0: 0x01, 1: 0x02, 8: 0x04, 9: 0x08,
+		12: 0x10, 13: 0x20, 14: 0x40, 15: 0x80,
+	};
+
+	const DEFAULT_KEYMAP: Record<string, number> = {
 		ArrowUp:    0x10,
 		ArrowDown:  0x20,
 		ArrowLeft:  0x40,
 		ArrowRight: 0x80,
+		ShiftRight: 0x04,
+		Enter:      0x08,
+		KeyZ:       0x02,
+		KeyX:       0x01,
+	};
+
+	const INPUT_CONFIG_KEY = 'nesplayer-input-config';
+
+	type InputConfig = {
+		player1Input:    PlayerInput;
+		player2Input:    PlayerInput;
+		player1KeyMap:   Record<string, number>;
+		player2KeyMap:   Record<string, number>;
+		gamepadProfiles: GamepadProfile[];
 	};
 
 	let container  = $state<HTMLDivElement | undefined>();
@@ -97,11 +113,11 @@
 	let overlayH    = $state(0);
 	let overlayLeft = $state(0);
 	let overlayW    = $state(0);
-	let nes        = $state<NESModule | null>(null);
+	let nes        = $state.raw<NESModule | null>(null);
 
 	let currentRomName = '';
 	let currentRomData: Uint8Array | null = null;
-	let autoPaused     = false;
+	let autoPaused     = $state(false);
 
 	let gl:         WebGLRenderingContext | null = null;
 	let texture:    WebGLTexture | null         = null;
@@ -118,9 +134,88 @@
 	let ringView:   Float32Array | null     = null;
 
 	let held        = new SvelteSet<string>();
-	let showOverlay = $state(false);
-	let powered     = $state(false);
-	let paused      = $state(false);
+	let showOverlay  = $state(false);
+	let powered      = $state(false);
+	let paused       = $state(false);
+	let userRegion   = $state<'auto' | 'ntsc' | 'pal'>('auto');
+	let autoRegion   = 0;
+	let isFullscreen        = $state(false);
+	let showControllerPanel = $state(false);
+
+	type GamepadInfo    = { id: string; index: number; name: string };
+	type GamepadProfile = { id: string; buttonMap: Record<number, number> };
+	type PlayerInput    = { type: 'keyboard' } | { type: 'gamepad'; id: string } | { type: 'none' };
+
+	let detectedGamepads = $state<GamepadInfo[]>([]);
+	let gamepadProfiles  = $state<GamepadProfile[]>([]);
+	let player1Input     = $state<PlayerInput>({ type: 'keyboard' });
+	let player2Input     = $state<PlayerInput>({ type: 'none' });
+	let player1KeyMap    = $state<Record<string, number>>({ ...DEFAULT_KEYMAP });
+	let player2KeyMap    = $state<Record<string, number>>({});
+
+	type DisconnectWarning = { padId: string; padName: string; player: 1 | 2 };
+	let disconnectWarning        = $state<DisconnectWarning | null>(null);
+	let waitingReconnect         = $state<{ padId: string; player: 1 | 2 } | null>(null);
+	let disconnectAutoPaused     = false;
+	let controllerPanelAutoPaused = false;
+	let configLoaded             = $state(false);
+	let savedP1GamepadId     = '';
+	let savedP2GamepadId     = '';
+
+	function padName(id: string): string {
+		const m = id.match(/^([^(]+)/);
+		return m ? m[1].trim() : id;
+	}
+
+	function padInfo(gp: Gamepad): GamepadInfo {
+		return { id: gp.id, index: gp.index, name: padName(gp.id) };
+	}
+
+	function loadInputConfig() {
+		try {
+			const raw = localStorage.getItem(INPUT_CONFIG_KEY);
+			if (!raw) { return; }
+			const cfg = JSON.parse(raw) as InputConfig;
+			if (cfg.player1Input) {
+				player1Input = cfg.player1Input;
+				if (cfg.player1Input.type === 'gamepad') { savedP1GamepadId = cfg.player1Input.id; }
+			}
+			if (cfg.player2Input) {
+				player2Input = cfg.player2Input;
+				if (cfg.player2Input.type === 'gamepad') { savedP2GamepadId = cfg.player2Input.id; }
+			}
+			if (cfg.player1KeyMap)   { player1KeyMap   = cfg.player1KeyMap; }
+			if (cfg.player2KeyMap)   { player2KeyMap   = cfg.player2KeyMap; }
+			if (cfg.gamepadProfiles) { gamepadProfiles = cfg.gamepadProfiles; }
+		} catch { }
+	}
+
+	function onDisconnectSwitchKeyboard() {
+		if (!disconnectWarning) { return; }
+		const { player } = disconnectWarning;
+		if (player === 1) { player1Input = { type: 'keyboard' }; }
+		else              { player2Input = { type: 'keyboard' }; }
+		if (disconnectAutoPaused) {
+			nes?._resume();
+			autoPaused           = false;
+			disconnectAutoPaused = false;
+		}
+		disconnectWarning = null;
+		waitingReconnect  = null;
+	}
+
+	function onDisconnectWait() {
+		if (!disconnectWarning) { return; }
+		waitingReconnect  = { padId: disconnectWarning.padId, player: disconnectWarning.player };
+		disconnectWarning = null;
+	}
+
+	function onDisconnectPowerOff() {
+		disconnectWarning    = null;
+		waitingReconnect     = null;
+		disconnectAutoPaused = false;
+		onPower();
+	}
 
 	function onContainerFocusIn() {
 		if (!nes || !autoPaused) { return; }
@@ -137,9 +232,10 @@
 
 	function onContainerDblClick() {
 		if (!nes || !powered) { return; }
-		if (paused) {
+		if (paused || autoPaused) {
 			nes._resume();
-			paused = false;
+			paused     = false;
+			autoPaused = false;
 		} else {
 			nes._pause();
 			paused = true;
@@ -154,58 +250,33 @@
 		if (!container) {
 			return;
 		}
-		const rect = container.getBoundingClientRect();
-		showOverlay = rect.right - e.clientX <= 52;
+		const rect        = container.getBoundingClientRect();
+		const canvasRight = rect.right - overlayLeft;
+		showOverlay = canvasRight - e.clientX <= 52;
 	}
 
 	function onContainerMouseLeave() {
 		showOverlay = false;
 	}
 
-	function pollButtons(): number {
+	function pollPlayer(input: PlayerInput, kmap: Record<string, number>): number {
 		let mask = 0;
-		for (const [code, bit] of Object.entries(KEY_MAP)) {
-			if (held.has(code)) {
-				mask |= bit;
+		if (input.type === 'keyboard') {
+			for (const [code, bit] of Object.entries(kmap)) {
+				if (held.has(code)) { mask |= bit; }
 			}
-		}
-		const pad = navigator.getGamepads()[0];
-		if (pad) {
-			if (pad.buttons[0]?.pressed) {
-				mask |= 0x01;
-			}
-			if (pad.buttons[1]?.pressed) {
-				mask |= 0x02;
-			}
-			if (pad.buttons[8]?.pressed) {
-				mask |= 0x04;
-			}
-			if (pad.buttons[9]?.pressed) {
-				mask |= 0x08;
-			}
-			if (pad.buttons[12]?.pressed) {
-				mask |= 0x10;
-			}
-			if (pad.buttons[13]?.pressed) {
-				mask |= 0x20;
-			}
-			if (pad.buttons[14]?.pressed) {
-				mask |= 0x40;
-			}
-			if (pad.buttons[15]?.pressed) {
-				mask |= 0x80;
-			}
-			if (pad.axes[0] < -0.5) {
-				mask |= 0x40;
-			}
-			if (pad.axes[0] > 0.5) {
-				mask |= 0x80;
-			}
-			if (pad.axes[1] < -0.5) {
-				mask |= 0x10;
-			}
-			if (pad.axes[1] > 0.5) {
-				mask |= 0x20;
+		} else if (input.type === 'gamepad') {
+			const pad = [...navigator.getGamepads()].find(p => p?.connected && p.id === input.id) ?? null;
+			if (pad) {
+				const profile = gamepadProfiles.find(p => p.id === input.id);
+				const bmap    = profile?.buttonMap ?? DEFAULT_GAMEPAD_BUTTON_MAP;
+				for (const [idx, bit] of Object.entries(bmap)) {
+					if (pad.buttons[Number(idx)]?.pressed) { mask |= bit; }
+				}
+				if (pad.axes[0] < -0.5) { mask |= 0x40; }
+				if (pad.axes[0] >  0.5) { mask |= 0x80; }
+				if (pad.axes[1] < -0.5) { mask |= 0x10; }
+				if (pad.axes[1] >  0.5) { mask |= 0x20; }
 			}
 		}
 		return mask;
@@ -285,6 +356,10 @@
 			throw new Error(`loadNESROM failed (${result})`);
 		}
 		restoreSaves(module);
+		autoRegion = module._getRegion();
+		if (userRegion === 'ntsc') { module._setRegion(0); }
+		else if (userRegion === 'pal') { module._setRegion(1); }
+		module._setAudioSampleRate(sampleRate);
 	}
 
 	function createShader(g: WebGLRenderingContext, type: number, src: string): WebGLShader | null {
@@ -401,6 +476,10 @@
 		overlayH    = h;
 		overlayLeft = Math.round((cw - w) / 2);
 		overlayW    = w;
+
+		if (nes && powered) {
+			drawFrame(nes);
+		}
 	}
 
 	function drawFrame(module: NESModule) {
@@ -437,7 +516,41 @@
 			return;
 		}
 
-		module._setButtons(0, pollButtons());
+		const livePads = [...navigator.getGamepads()];
+
+		if (!disconnectWarning && powered && !paused && !autoPaused) {
+			for (const player of [1, 2] as const) {
+				const inp = player === 1 ? player1Input : player2Input;
+				if (inp.type !== 'gamepad') { continue; }
+				if (!detectedGamepads.some(p => p.id === inp.id)) { continue; }
+				if (!livePads.some(p => p?.connected && p.id === inp.id)) {
+					detectedGamepads     = detectedGamepads.filter(p => p.id !== inp.id);
+					module._pause();
+					disconnectAutoPaused = true;
+					autoPaused           = true;
+					disconnectWarning    = { padId: inp.id, padName: padName(inp.id), player };
+					break;
+				}
+			}
+		}
+
+		const pendingReconnectId = waitingReconnect?.padId ?? disconnectWarning?.padId;
+		if (pendingReconnectId) {
+			const rejoined = livePads.find(p => p?.connected && p.id === pendingReconnectId);
+			if (rejoined) {
+				if (!detectedGamepads.some(p => p.id === rejoined.id)) {
+					detectedGamepads = [...detectedGamepads, padInfo(rejoined)];
+				}
+				module._resume();
+				autoPaused           = false;
+				disconnectAutoPaused = false;
+				waitingReconnect     = null;
+				disconnectWarning    = null;
+			}
+		}
+
+		module._setButtons(0, pollPlayer(player1Input, player1KeyMap));
+		module._setButtons(1, pollPlayer(player2Input, player2KeyMap));
 
 		if (module._isPaused()) {
 			lastTime   = 0;
@@ -490,7 +603,10 @@
 		currentRomData = rom;
 		lastTime       = 0;
 		cycleAccum     = 0;
+		paused         = false;
+		autoPaused     = false;
 		powered        = true;
+		nes._resume();
 		loadROM(nes, rom);
 	});
 
@@ -515,6 +631,28 @@
 			await old.close();
 			await initAudio(nes!);
 		})();
+	});
+
+	$effect(() => {
+		if (!configLoaded) { return; }
+		localStorage.setItem(INPUT_CONFIG_KEY, JSON.stringify({
+			player1Input, player2Input, player1KeyMap, player2KeyMap, gamepadProfiles,
+		}));
+	});
+
+	$effect(() => {
+		if (!nes || !powered) { return; }
+		if (showControllerPanel) {
+			if (!paused && !autoPaused) {
+				nes._pause();
+				autoPaused               = true;
+				controllerPanelAutoPaused = true;
+			}
+		} else if (controllerPanelAutoPaused) {
+			nes._resume();
+			autoPaused               = false;
+			controllerPanelAutoPaused = false;
+		}
 	});
 
 	function clearScreen() {
@@ -553,12 +691,11 @@
 	}
 
 	function onPauseToggle() {
-		if (!nes) {
-			return;
-		}
-		if (paused) {
+		if (!nes) { return; }
+		if (paused || autoPaused) {
 			nes._resume();
-			paused = false;
+			paused     = false;
+			autoPaused = false;
 		} else {
 			nes._pause();
 			paused = true;
@@ -566,14 +703,33 @@
 	}
 
 	function onReset() {
-		if (!nes) {
-			return;
-		}
+		if (!nes) { return; }
 		nes._reset();
 		nes._resume();
 		lastTime   = 0;
 		cycleAccum = 0;
 		paused     = false;
+		autoPaused = false;
+	}
+
+	function onRegionToggle() {
+		userRegion = userRegion === 'auto' ? 'ntsc' : userRegion === 'ntsc' ? 'pal' : 'auto';
+		if (!nes || !powered) { return; }
+		const r = userRegion === 'pal' ? 1 : userRegion === 'ntsc' ? 0 : autoRegion;
+		nes._reset();
+		nes._setRegion(r);
+		nes._setAudioSampleRate(sampleRate);
+		lastTime   = 0;
+		cycleAccum = 0;
+		paused     = false;
+	}
+
+	function onFullscreenToggle() {
+		if (!document.fullscreenElement) {
+			container?.requestFullscreen();
+		} else {
+			document.exitFullscreen();
+		}
 	}
 
 	function onVolumeInput(e: Event) {
@@ -588,7 +744,8 @@
 		muted = !muted;
 	}
 
-	function onInsertRomClick() {
+	function onInsertRomClick(e: MouseEvent) {
+		(e.currentTarget as HTMLButtonElement).blur();
 		fileInput?.click();
 	}
 
@@ -598,38 +755,34 @@
 			return;
 		}
 
-		// Flush saves for the current ROM before evicting it
 		flushSRAM(nes);
 		flushFlash(nes);
-
-		// Reset clears CPU, PPU, APU and mapper state without evicting the ROM slot
 		nes._reset();
-
-		// Reset animation timing so the first frame isn't a huge jump
-		lastTime   = 0;
-		cycleAccum = 0;
-
-		// Clear audio sample buffer left over from the previous ROM
 		nes._clearAudioSamples();
 
-		// Set the new ROM name before loading so restoreSaves uses the right key
-		currentRomName = file.name.replace(/\.nes$/i, '');
+		lastTime   = 0;
+		cycleAccum = 0;
+		paused     = false;
+		autoPaused = false;
 
+		currentRomName = file.name.replace(/\.nes$/i, '');
 		const data     = new Uint8Array(await file.arrayBuffer());
 		currentRomData = data;
 		powered        = true;
+		nes._resume();
 		loadROM(nes, data);
 
-		// Reset the file input so the same file can be re-inserted
 		(e.target as HTMLInputElement).value = '';
 	}
 
 	onMount(() => {
+		loadInputConfig();
+		configLoaded = true;
+
 		const onKeyDown = (e: KeyboardEvent) => {
 			const tag = (e.target as HTMLElement)?.tagName;
-			if (tag === 'INPUT' || tag === 'TEXTAREA') {
-				return;
-			}
+			if (tag === 'INPUT' || tag === 'TEXTAREA') { return; }
+			if (showControllerPanel) { return; }
 			held.add(e.code);
 			if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.code)) {
 				e.preventDefault();
@@ -668,6 +821,67 @@
 		document.addEventListener('keydown',     resumeCtx);
 		document.addEventListener('pointerdown', resumeCtx);
 
+		const onFullscreenChange = () => { isFullscreen = !!document.fullscreenElement; };
+		document.addEventListener('fullscreenchange', onFullscreenChange);
+
+		function applyAutoAssign(id: string) {
+			if (id === savedP1GamepadId && player1Input.type !== 'gamepad') {
+				player1Input = { type: 'gamepad', id };
+			} else if (id === savedP2GamepadId && player2Input.type !== 'gamepad') {
+				player2Input = { type: 'gamepad', id };
+			}
+		}
+
+		function handlePadConnect(gp: Gamepad) {
+			if (detectedGamepads.some(p => p.id === gp.id)) { return; }
+			detectedGamepads = [...detectedGamepads, padInfo(gp)];
+			applyAutoAssign(gp.id);
+			const pendingId = waitingReconnect?.padId ?? disconnectWarning?.padId;
+			if (pendingId === gp.id) {
+				if (disconnectAutoPaused) {
+					nes?._resume();
+					autoPaused           = false;
+					disconnectAutoPaused = false;
+				}
+				waitingReconnect  = null;
+				disconnectWarning = null;
+			}
+		}
+
+		function handlePadDisconnect(id: string) {
+			if (!detectedGamepads.some(p => p.id === id)) { return; }
+			if (disconnectWarning?.padId === id) { return; }
+			detectedGamepads = detectedGamepads.filter(p => p.id !== id);
+			const player =
+				player1Input.type === 'gamepad' && player1Input.id === id ? 1 as const :
+				player2Input.type === 'gamepad' && player2Input.id === id ? 2 as const : null;
+			if (player !== null && powered && !paused && !autoPaused) {
+				nes?._pause();
+				disconnectAutoPaused = true;
+				autoPaused           = true;
+				disconnectWarning    = { padId: id, padName: padName(id), player };
+			}
+		}
+
+		function syncGamepads() {
+			const current = [...navigator.getGamepads()].filter(Boolean) as Gamepad[];
+			for (const gp of current) {
+				handlePadConnect(gp);
+			}
+			for (const known of [...detectedGamepads]) {
+				if (!current.some(gp => gp.id === known.id)) {
+					handlePadDisconnect(known.id);
+				}
+			}
+		}
+		syncGamepads();
+		const padPollInterval = setInterval(syncGamepads, 500);
+
+		const onGamepadConnected    = () => syncGamepads();
+		const onGamepadDisconnected = () => syncGamepads();
+		window.addEventListener('gamepadconnected',    onGamepadConnected);
+		window.addEventListener('gamepaddisconnected', onGamepadDisconnected);
+
 		void (async () => {
 			const module  = await createNESPlayerModule({
 				locateFile: (f: string) => f.endsWith('.wasm') ? nesPlayerWasmUrl : f,
@@ -695,9 +909,13 @@
 			window.removeEventListener('keyup',        onKeyUp);
 			window.removeEventListener('beforeunload', onUnload);
 			held.clear();
-			document.removeEventListener('click',       resumeCtx);
-			document.removeEventListener('keydown',     resumeCtx);
-			document.removeEventListener('pointerdown', resumeCtx);
+			document.removeEventListener('click',            resumeCtx);
+			document.removeEventListener('keydown',          resumeCtx);
+			document.removeEventListener('pointerdown',      resumeCtx);
+			document.removeEventListener('fullscreenchange', onFullscreenChange);
+			clearInterval(padPollInterval);
+			window.removeEventListener('gamepadconnected',    onGamepadConnected);
+			window.removeEventListener('gamepaddisconnected', onGamepadDisconnected);
 		};
 	});
 </script>
@@ -717,7 +935,7 @@
 >
 	<canvas bind:this={canvas}></canvas>
 
-	{#if paused && powered}
+	{#if (paused || autoPaused) && powered}
 		<div
 			class="pause-overlay"
 			style="top: {overlayTop}px; left: {overlayLeft}px; width: {overlayW}px; height: {overlayH}px;"
@@ -726,7 +944,7 @@
 		</div>
 	{/if}
 
-	<div class="overlay-zone" class:visible={showOverlay} style="top: {overlayTop}px; height: {overlayH}px;">
+	<div class="overlay-zone" class:visible={showOverlay} style="top: {overlayTop}px; right: {overlayLeft}px; height: {overlayH}px;">
 		<div
 			class="overlay-panel"
 			role="toolbar"
@@ -736,15 +954,15 @@
 			onkeydown={(e) => e.stopPropagation()}
 		>
 
-			<button class="overlay-btn" class:powered title={powered ? 'Power off' : 'Power on'} onclick={onPower}>
+			<button class="overlay-btn" class:powered data-tip={powered ? 'Power off' : 'Power on'} onclick={onPower}>
 				<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 					<path d="M12 2v6"/>
 					<path d="M6.4 5.4a8 8 0 1 0 11.2 0"/>
 				</svg>
 			</button>
 
-			<button class="overlay-btn" class:active={paused} title={paused ? 'Resume' : 'Pause'} onclick={onPauseToggle}>
-				{#if paused}
+			<button class="overlay-btn" class:active={paused || autoPaused} data-tip={(paused || autoPaused) ? 'Resume' : 'Pause'} onclick={onPauseToggle}>
+				{#if paused || autoPaused}
 					<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 						<polygon points="5 3 19 12 5 21 5 3"/>
 					</svg>
@@ -756,7 +974,7 @@
 				{/if}
 			</button>
 
-			<button class="overlay-btn" title="Reset" onclick={onReset}>
+			<button class="overlay-btn" data-tip="Reset" onclick={onReset}>
 				<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 					<path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/>
 					<path d="M3 3v5h5"/>
@@ -773,7 +991,7 @@
 				/>
 			</div>
 
-			<button class="overlay-btn" class:active={muted} title={muted ? 'Unmute' : 'Mute'} onclick={onMuteToggle}>
+			<button class="overlay-btn" class:active={muted} data-tip={muted ? 'Unmute' : 'Mute'} onclick={onMuteToggle}>
 				{#if muted}
 					<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 						<polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>
@@ -788,7 +1006,7 @@
 				{/if}
 			</button>
 
-			<button class="overlay-btn" title="Insert ROM" onclick={onInsertRomClick}>
+			<button class="overlay-btn" data-tip="Insert ROM" onclick={onInsertRomClick}>
 				<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 					<path d="M4 2h16a2 2 0 0 1 2 2v10h-5v6h-10v-6H2V4a2 2 0 0 1 2-2z"/>
 					<rect x="5" y="5" width="14" height="6" rx="1"/>
@@ -796,7 +1014,7 @@
 			</button>
 			<input bind:this={fileInput} type="file" accept=".nes" style="display:none" onchange={onFileChange} />
 
-			<button class="overlay-btn" title="Controllers">
+			<button class="overlay-btn" class:active={showControllerPanel} data-tip="Controllers" onclick={() => { showControllerPanel = !showControllerPanel; }}>
 				<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 					<line x1="6" y1="12" x2="10" y2="12"/>
 					<line x1="8" y1="10" x2="8" y2="14"/>
@@ -806,15 +1024,87 @@
 				</svg>
 			</button>
 
-			<button class="overlay-btn" title="Settings">
-				<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-					<circle cx="12" cy="12" r="3"/>
-					<path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
-				</svg>
+			<button class="overlay-btn overlay-btn--region" data-tip="Toggle region (Auto / NTSC / PAL)" onclick={onRegionToggle}>
+				{userRegion === 'ntsc' ? 'NTSC' : userRegion === 'pal' ? 'PAL' : 'Auto'}
+			</button>
+
+			<button class="overlay-btn" data-tip={isFullscreen ? 'Exit fullscreen' : 'Fullscreen'} onclick={onFullscreenToggle}>
+				{#if isFullscreen}
+					<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+						<path d="M8 3v3a2 2 0 0 1-2 2H3"/>
+						<path d="M21 8h-3a2 2 0 0 1-2-2V3"/>
+						<path d="M3 16h3a2 2 0 0 1 2 2v3"/>
+						<path d="M16 21v-3a2 2 0 0 1 2-2h3"/>
+					</svg>
+				{:else}
+					<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+						<path d="M3 7V5a2 2 0 0 1 2-2h2"/>
+						<path d="M17 3h2a2 2 0 0 1 2 2v2"/>
+						<path d="M21 17v2a2 2 0 0 1-2 2h-2"/>
+						<path d="M7 21H5a2 2 0 0 1-2-2v-2"/>
+					</svg>
+				{/if}
 			</button>
 
 		</div>
 	</div>
+
+	{#if disconnectWarning}
+		<!-- svelte-ignore a11y_no_static_element_interactions -->
+		<div class="dc-backdrop"></div>
+		<div
+			class="dc-dialog"
+			role="alertdialog"
+			aria-label="Controller disconnected"
+			onclick={(e) => e.stopPropagation()}
+			ondblclick={(e) => e.stopPropagation()}
+		>
+			<svg class="dc-icon" width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#f59e0b" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+				<path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/>
+				<line x1="12" y1="9" x2="12" y2="13"/>
+				<line x1="12" y1="17" x2="12.01" y2="17"/>
+			</svg>
+			<p class="dc-msg">Player {disconnectWarning.player} controller disconnected</p>
+			<span class="dc-name">{disconnectWarning.padName}</span>
+			<div class="dc-btns">
+				<button class="dc-btn" onclick={onDisconnectSwitchKeyboard}>Switch to Keyboard</button>
+				<button class="dc-btn dc-btn--wait" onclick={onDisconnectWait}>Wait for Reconnect</button>
+				<button class="dc-btn dc-btn--off" onclick={onDisconnectPowerOff}>Power Off</button>
+			</div>
+		</div>
+	{/if}
+
+	{#if waitingReconnect}
+		<div class="dc-waiting" onclick={(e) => e.stopPropagation()} ondblclick={(e) => e.stopPropagation()}>
+			<span class="dc-waiting-dot"></span>
+			<span>P{waitingReconnect.player} — waiting for controller…</span>
+			<button onclick={() => {
+				if (disconnectAutoPaused) { nes?._resume(); autoPaused = false; disconnectAutoPaused = false; }
+				waitingReconnect = null;
+			}}>Dismiss</button>
+		</div>
+	{/if}
+
+	{#if showControllerPanel}
+		<ControllerPanel
+			defaultKeyMap={DEFAULT_KEYMAP}
+			defaultGamepadButtonMap={DEFAULT_GAMEPAD_BUTTON_MAP}
+			{detectedGamepads}
+			{gamepadProfiles}
+			{player1Input}
+			{player2Input}
+			{player1KeyMap}
+			{player2KeyMap}
+			onplayer1inputchange={(v) => { player1Input = v; }}
+			onplayer2inputchange={(v) => { player2Input = v; }}
+			onplayer1keymapchange={(m) => { player1KeyMap = m; }}
+			onplayer2keymapchange={(m) => { player2KeyMap = m; }}
+			ongpprofilechange={(p) => {
+				gamepadProfiles = [...gamepadProfiles.filter(x => x.id !== p.id), p];
+			}}
+			onclose={() => { showControllerPanel = false; }}
+		/>
+	{/if}
 </div>
 
 <style>
@@ -845,9 +1135,7 @@
 
 	.overlay-zone {
 		position: absolute;
-		right: 0;
 		width: 52px;
-		overflow: hidden;
 		pointer-events: none;
 	}
 
@@ -865,7 +1153,6 @@
 		align-items: center;
 		padding: 6px 0;
 		gap: 4px;
-		overflow: hidden;
 		opacity: 0;
 		transition: opacity 0.15s ease;
 	}
@@ -901,6 +1188,40 @@
 		color: #4ade80;
 	}
 
+	.overlay-btn--region {
+		font-size: 0.6rem;
+		font-weight: 700;
+		letter-spacing: 0.05em;
+	}
+
+	.overlay-btn[data-tip] {
+		position: relative;
+	}
+
+	.overlay-btn[data-tip]::after {
+		content: attr(data-tip);
+		position: absolute;
+		right: calc(100% + 8px);
+		top: 50%;
+		transform: translateY(-50%);
+		background: rgba(0, 0, 0, 0.85);
+		color: rgba(255, 255, 255, 0.9);
+		font-size: 0.68rem;
+		font-weight: 500;
+		padding: 3px 8px;
+		border-radius: 4px;
+		white-space: nowrap;
+		pointer-events: none;
+		opacity: 0;
+		transition: opacity 0.12s ease 0s;
+	}
+
+	.overlay-btn[data-tip]:hover::after {
+		opacity: 1;
+		transition-delay: 0.5s;
+	}
+
+
 	.slider-wrap {
 		flex: 1;
 		width: 100%;
@@ -918,5 +1239,144 @@
 		height: 100%;
 		cursor: pointer;
 		accent-color: rgba(255, 255, 255, 0.85);
+	}
+
+	.dc-backdrop {
+		position: absolute;
+		inset: 0;
+		background: rgba(0, 0, 0, 0.65);
+		z-index: 30;
+	}
+
+	.dc-dialog {
+		position: absolute;
+		inset: 0;
+		margin: auto;
+		width: min(260px, calc(100% - 48px));
+		height: fit-content;
+		background: #0d0d1c;
+		border: 1px solid rgba(255, 255, 255, 0.1);
+		border-radius: 10px;
+		z-index: 31;
+		padding: 20px 18px 16px;
+		display: flex;
+		flex-direction: column;
+		align-items: center;
+		gap: 6px;
+		box-shadow: 0 10px 40px rgba(0, 0, 0, 0.8);
+	}
+
+	.dc-icon {
+		margin-bottom: 2px;
+	}
+
+	.dc-msg {
+		font-size: 0.82rem;
+		color: rgba(255, 255, 255, 0.85);
+		text-align: center;
+		margin: 0;
+		font-weight: 600;
+	}
+
+	.dc-name {
+		font-size: 0.63rem;
+		color: rgba(255, 255, 255, 0.35);
+		text-align: center;
+	}
+
+	.dc-btns {
+		display: flex;
+		flex-direction: column;
+		gap: 6px;
+		width: 100%;
+		margin-top: 8px;
+	}
+
+	.dc-btn {
+		width: 100%;
+		height: 30px;
+		border: 1px solid rgba(255, 255, 255, 0.12);
+		border-radius: 5px;
+		background: rgba(255, 255, 255, 0.06);
+		color: rgba(255, 255, 255, 0.75);
+		font-size: 0.72rem;
+		font-weight: 600;
+		cursor: pointer;
+		transition: background 0.1s, border-color 0.1s, color 0.1s;
+	}
+
+	.dc-btn:hover {
+		background: rgba(255, 255, 255, 0.12);
+		border-color: rgba(255, 255, 255, 0.24);
+		color: rgba(255, 255, 255, 0.95);
+	}
+
+	.dc-btn--wait {
+		border-color: rgba(74, 222, 128, 0.25);
+		color: #4ade80;
+	}
+
+	.dc-btn--wait:hover {
+		background: rgba(74, 222, 128, 0.1);
+		border-color: rgba(74, 222, 128, 0.45);
+	}
+
+	.dc-btn--off {
+		border-color: rgba(248, 113, 113, 0.25);
+		color: #f87171;
+	}
+
+	.dc-btn--off:hover {
+		background: rgba(248, 113, 113, 0.1);
+		border-color: rgba(248, 113, 113, 0.45);
+	}
+
+	.dc-waiting {
+		position: absolute;
+		bottom: 10px;
+		left: 50%;
+		transform: translateX(-50%);
+		background: rgba(10, 10, 20, 0.88);
+		border: 1px solid rgba(255, 255, 255, 0.1);
+		border-radius: 20px;
+		padding: 5px 14px 5px 10px;
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		z-index: 20;
+		white-space: nowrap;
+	}
+
+	.dc-waiting-dot {
+		width: 6px;
+		height: 6px;
+		border-radius: 50%;
+		background: #f59e0b;
+		flex-shrink: 0;
+		animation: dc-blink 1.2s ease-in-out infinite;
+	}
+
+	@keyframes dc-blink {
+		0%, 100% { opacity: 1; }
+		50%       { opacity: 0.2; }
+	}
+
+	.dc-waiting span {
+		font-size: 0.68rem;
+		color: rgba(255, 255, 255, 0.6);
+	}
+
+	.dc-waiting button {
+		font-size: 0.62rem;
+		color: rgba(255, 255, 255, 0.3);
+		background: none;
+		border: none;
+		cursor: pointer;
+		padding: 0;
+		margin-left: 2px;
+	}
+
+	.dc-waiting button:hover {
+		color: rgba(255, 255, 255, 0.65);
 	}
 </style>

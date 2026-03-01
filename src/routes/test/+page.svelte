@@ -10,28 +10,24 @@
 
 	let dragging = false;
 	let startX   = 0;
-	let startY   = 0;
 	let startW   = 0;
-	let startH   = 0;
 
 	onMount(() => {
-		boxW = window.innerWidth * 0.35;
+		boxW = window.innerWidth * 0.50;
 		boxH = boxW / NES_ASPECT;
 	});
 
 	function onHandleDown(e: PointerEvent) {
 		dragging = true;
 		startX   = e.clientX;
-		startY   = e.clientY;
 		startW   = boxW;
-		startH   = boxH;
 		(e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
 	}
 
 	function onHandleMove(e: PointerEvent) {
 		if (!dragging) { return; }
 		boxW = Math.max(MIN_SIZE, startW + (e.clientX - startX));
-		boxH = Math.max(MIN_SIZE, startH + (e.clientY - startY));
+		boxH = boxW / NES_ASPECT;
 	}
 
 	function onHandleUp() {
