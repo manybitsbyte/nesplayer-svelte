@@ -40,14 +40,20 @@
 	}
 
 	interface Props {
-		rom:        Uint8Array;
-		romName:    string;
-		volume?:    number;
-		muted?:     boolean;
+		rom?:        Uint8Array;
+		romName?:    string;
+		volume?:     number;
+		muted?:      boolean;
 		sampleRate?: 48000 | 44100;
 	}
 
-	let { rom, romName, volume = 1, muted = false, sampleRate = 48000 }: Props = $props();
+	let {
+		rom,
+		romName,
+		volume     = $bindable(1),
+		muted      = $bindable(false),
+		sampleRate = $bindable<48000 | 44100>(48000),
+	}: Props = $props();
 
 	const SCREEN_W  = 256;
 	const SCREEN_H  = 240;
@@ -84,9 +90,18 @@
 		ArrowRight: 0x80,
 	};
 
-	let container = $state<HTMLDivElement | undefined>();
-	let canvas    = $state<HTMLCanvasElement | undefined>();
-	let nes       = $state<NESModule | null>(null);
+	let container  = $state<HTMLDivElement | undefined>();
+	let canvas     = $state<HTMLCanvasElement | undefined>();
+	let fileInput  = $state<HTMLInputElement | undefined>();
+	let overlayTop  = $state(0);
+	let overlayH    = $state(0);
+	let overlayLeft = $state(0);
+	let overlayW    = $state(0);
+	let nes        = $state<NESModule | null>(null);
+
+	let currentRomName = '';
+	let currentRomData: Uint8Array | null = null;
+	let autoPaused     = false;
 
 	let gl:         WebGLRenderingContext | null = null;
 	let texture:    WebGLTexture | null         = null;
@@ -102,7 +117,50 @@
 	let headerView: Int32Array | null       = null;
 	let ringView:   Float32Array | null     = null;
 
-	let held = new SvelteSet<string>();
+	let held        = new SvelteSet<string>();
+	let showOverlay = $state(false);
+	let powered     = $state(false);
+	let paused      = $state(false);
+
+	function onContainerFocusIn() {
+		if (!nes || !autoPaused) { return; }
+		nes._resume();
+		autoPaused = false;
+	}
+
+	function onContainerFocusOut(e: FocusEvent) {
+		if (container?.contains(e.relatedTarget as Node)) { return; }
+		if (!nes || paused || !powered) { return; }
+		nes._pause();
+		autoPaused = true;
+	}
+
+	function onContainerDblClick() {
+		if (!nes || !powered) { return; }
+		if (paused) {
+			nes._resume();
+			paused = false;
+		} else {
+			nes._pause();
+			paused = true;
+		}
+	}
+
+	function onContainerPointerDown() {
+		container?.focus({ preventScroll: true });
+	}
+
+	function onContainerMouseMove(e: MouseEvent) {
+		if (!container) {
+			return;
+		}
+		const rect = container.getBoundingClientRect();
+		showOverlay = rect.right - e.clientX <= 52;
+	}
+
+	function onContainerMouseLeave() {
+		showOverlay = false;
+	}
 
 	function pollButtons(): number {
 		let mask = 0;
@@ -181,12 +239,12 @@
 	}
 
 	function restoreSaves(module: NESModule) {
-		const sramSave = localStorage.getItem(`nesplayer-${romName}.sram`);
+		const sramSave = localStorage.getItem(`nesplayer-${currentRomName}.sram`);
 		if (sramSave && module._hasBattery()) {
 			const bytes = Uint8Array.from(atob(sramSave), c => c.charCodeAt(0));
 			module.HEAPU8.set(bytes, module._getSRAMPtr());
 		}
-		const flashSave = localStorage.getItem(`nesplayer-${romName}.flash`);
+		const flashSave = localStorage.getItem(`nesplayer-${currentRomName}.flash`);
 		if (flashSave) {
 			const bytes = Uint8Array.from(atob(flashSave), c => c.charCodeAt(0));
 			const ptr   = module._getPRGRomPtr();
@@ -203,7 +261,7 @@
 		const ptr  = module._getSRAMPtr();
 		const size = module._getSRAMSize();
 		const data = module.HEAPU8.slice(ptr, ptr + size);
-		localStorage.setItem(`nesplayer-${romName}.sram`, btoa(String.fromCharCode(...data)));
+		localStorage.setItem(`nesplayer-${currentRomName}.sram`, btoa(String.fromCharCode(...data)));
 		module._clearSRAMDirty();
 	}
 
@@ -214,7 +272,7 @@
 		const ptr  = module._getPRGRomPtr();
 		const size = module._getPRGRomSize();
 		const data = module.HEAPU8.slice(ptr, ptr + size);
-		localStorage.setItem(`nesplayer-${romName}.flash`, btoa(String.fromCharCode(...data)));
+		localStorage.setItem(`nesplayer-${currentRomName}.flash`, btoa(String.fromCharCode(...data)));
 		module._clearFlashDirty();
 	}
 
@@ -336,9 +394,13 @@
 		}
 		canvas.style.width  = `${w}px`;
 		canvas.style.height = `${h}px`;
-		const dpr     = window.devicePixelRatio || 1;
+		const dpr = window.devicePixelRatio || 1;
 		canvas.width  = Math.round(w * dpr);
 		canvas.height = Math.round(h * dpr);
+		overlayTop  = Math.round((ch - h) / 2);
+		overlayH    = h;
+		overlayLeft = Math.round((cw - w) / 2);
+		overlayW    = w;
 	}
 
 	function drawFrame(module: NESModule) {
@@ -424,8 +486,11 @@
 		if (!nes || !rom) {
 			return;
 		}
-		lastTime   = 0;
-		cycleAccum = 0;
+		currentRomName = romName ?? '';
+		currentRomData = rom;
+		lastTime       = 0;
+		cycleAccum     = 0;
+		powered        = true;
 		loadROM(nes, rom);
 	});
 
@@ -451,6 +516,113 @@
 			await initAudio(nes!);
 		})();
 	});
+
+	function clearScreen() {
+		if (!gl) {
+			return;
+		}
+		gl.clearColor(0, 0, 0, 1);
+		gl.clear(gl.COLOR_BUFFER_BIT);
+	}
+
+	function onPower() {
+		if (!nes) {
+			return;
+		}
+		if (powered) {
+			flushSRAM(nes);
+			flushFlash(nes);
+			nes._powerOff();
+			nes._pause();
+			nes._clearAudioSamples();
+			lastTime   = 0;
+			cycleAccum = 0;
+			clearScreen();
+			powered = false;
+			paused  = false;
+		} else {
+			nes._powerOn();
+			nes._resume();
+			lastTime   = 0;
+			cycleAccum = 0;
+			if (currentRomData) {
+				loadROM(nes, currentRomData);
+			}
+			powered = true;
+		}
+	}
+
+	function onPauseToggle() {
+		if (!nes) {
+			return;
+		}
+		if (paused) {
+			nes._resume();
+			paused = false;
+		} else {
+			nes._pause();
+			paused = true;
+		}
+	}
+
+	function onReset() {
+		if (!nes) {
+			return;
+		}
+		nes._reset();
+		nes._resume();
+		lastTime   = 0;
+		cycleAccum = 0;
+		paused     = false;
+	}
+
+	function onVolumeInput(e: Event) {
+		const val = parseFloat((e.target as HTMLInputElement).value);
+		volume = val;
+		if (val > 0) {
+			muted = false;
+		}
+	}
+
+	function onMuteToggle() {
+		muted = !muted;
+	}
+
+	function onInsertRomClick() {
+		fileInput?.click();
+	}
+
+	async function onFileChange(e: Event) {
+		const file = (e.target as HTMLInputElement).files?.[0];
+		if (!file || !nes) {
+			return;
+		}
+
+		// Flush saves for the current ROM before evicting it
+		flushSRAM(nes);
+		flushFlash(nes);
+
+		// Reset clears CPU, PPU, APU and mapper state without evicting the ROM slot
+		nes._reset();
+
+		// Reset animation timing so the first frame isn't a huge jump
+		lastTime   = 0;
+		cycleAccum = 0;
+
+		// Clear audio sample buffer left over from the previous ROM
+		nes._clearAudioSamples();
+
+		// Set the new ROM name before loading so restoreSaves uses the right key
+		currentRomName = file.name.replace(/\.nes$/i, '');
+
+		const data     = new Uint8Array(await file.arrayBuffer());
+		currentRomData = data;
+		powered        = true;
+		loadROM(nes, data);
+
+		// Reset the file input so the same file can be re-inserted
+		(e.target as HTMLInputElement).value = '';
+	}
 
 	onMount(() => {
 		const onKeyDown = (e: KeyboardEvent) => {
@@ -530,8 +702,119 @@
 	});
 </script>
 
-<div bind:this={container} class="nes-screen">
+<div
+	bind:this={container}
+	class="nes-screen"
+	role="application"
+	aria-label="NES emulator"
+	tabindex="-1"
+	onpointerdown={onContainerPointerDown}
+	ondblclick={onContainerDblClick}
+	onmousemove={onContainerMouseMove}
+	onmouseleave={onContainerMouseLeave}
+	onfocusin={onContainerFocusIn}
+	onfocusout={onContainerFocusOut}
+>
 	<canvas bind:this={canvas}></canvas>
+
+	{#if paused && powered}
+		<div
+			class="pause-overlay"
+			style="top: {overlayTop}px; left: {overlayLeft}px; width: {overlayW}px; height: {overlayH}px;"
+		>
+			Paused
+		</div>
+	{/if}
+
+	<div class="overlay-zone" class:visible={showOverlay} style="top: {overlayTop}px; height: {overlayH}px;">
+		<div
+			class="overlay-panel"
+			role="toolbar"
+			aria-label="Emulator controls"
+			onclick={(e) => e.stopPropagation()}
+			ondblclick={(e) => e.stopPropagation()}
+			onkeydown={(e) => e.stopPropagation()}
+		>
+
+			<button class="overlay-btn" class:powered title={powered ? 'Power off' : 'Power on'} onclick={onPower}>
+				<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+					<path d="M12 2v6"/>
+					<path d="M6.4 5.4a8 8 0 1 0 11.2 0"/>
+				</svg>
+			</button>
+
+			<button class="overlay-btn" class:active={paused} title={paused ? 'Resume' : 'Pause'} onclick={onPauseToggle}>
+				{#if paused}
+					<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+						<polygon points="5 3 19 12 5 21 5 3"/>
+					</svg>
+				{:else}
+					<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+						<rect x="6" y="4" width="4" height="16"/>
+						<rect x="14" y="4" width="4" height="16"/>
+					</svg>
+				{/if}
+			</button>
+
+			<button class="overlay-btn" title="Reset" onclick={onReset}>
+				<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+					<path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/>
+					<path d="M3 3v5h5"/>
+				</svg>
+			</button>
+
+			<div class="slider-wrap">
+				<input
+					type="range"
+					class="vol-slider"
+					min="0" max="1" step="0.01"
+					value={muted ? 0 : volume}
+					oninput={onVolumeInput}
+				/>
+			</div>
+
+			<button class="overlay-btn" class:active={muted} title={muted ? 'Unmute' : 'Mute'} onclick={onMuteToggle}>
+				{#if muted}
+					<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+						<polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>
+						<line x1="23" y1="9" x2="17" y2="15"/>
+						<line x1="17" y1="9" x2="23" y2="15"/>
+					</svg>
+				{:else}
+					<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+						<polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>
+						<path d="M15.54 8.46a5 5 0 0 1 0 7.07"/>
+					</svg>
+				{/if}
+			</button>
+
+			<button class="overlay-btn" title="Insert ROM" onclick={onInsertRomClick}>
+				<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+					<path d="M4 2h16a2 2 0 0 1 2 2v10h-5v6h-10v-6H2V4a2 2 0 0 1 2-2z"/>
+					<rect x="5" y="5" width="14" height="6" rx="1"/>
+				</svg>
+			</button>
+			<input bind:this={fileInput} type="file" accept=".nes" style="display:none" onchange={onFileChange} />
+
+			<button class="overlay-btn" title="Controllers">
+				<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+					<line x1="6" y1="12" x2="10" y2="12"/>
+					<line x1="8" y1="10" x2="8" y2="14"/>
+					<circle cx="15" cy="13" r="0.5" fill="currentColor"/>
+					<circle cx="18" cy="11" r="0.5" fill="currentColor"/>
+					<rect x="2" y="6" width="20" height="12" rx="2"/>
+				</svg>
+			</button>
+
+			<button class="overlay-btn" title="Settings">
+				<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+					<circle cx="12" cy="12" r="3"/>
+					<path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+				</svg>
+			</button>
+
+		</div>
+	</div>
 </div>
 
 <style>
@@ -542,5 +825,98 @@
 		align-items: center;
 		justify-content: center;
 		background: black;
+		position: relative;
+		outline: none;
+	}
+
+	.pause-overlay {
+		position: absolute;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		background: rgba(0, 0, 0, 0.45);
+		color: rgba(255, 255, 255, 0.9);
+		font-size: 1.5rem;
+		font-weight: 600;
+		letter-spacing: 0.15em;
+		text-transform: uppercase;
+		pointer-events: none;
+	}
+
+	.overlay-zone {
+		position: absolute;
+		right: 0;
+		width: 52px;
+		overflow: hidden;
+		pointer-events: none;
+	}
+
+	.overlay-zone.visible {
+		pointer-events: auto;
+	}
+
+	.overlay-panel {
+		position: absolute;
+		inset: 0;
+		box-sizing: border-box;
+		background: rgba(0, 0, 0, 0.6);
+		display: flex;
+		flex-direction: column;
+		align-items: center;
+		padding: 6px 0;
+		gap: 4px;
+		overflow: hidden;
+		opacity: 0;
+		transition: opacity 0.15s ease;
+	}
+
+	.overlay-zone.visible .overlay-panel {
+		opacity: 1;
+	}
+
+	.overlay-btn {
+		width: 36px;
+		height: 36px;
+		min-height: 0;
+		border: none;
+		border-radius: 4px;
+		background: rgba(255, 255, 255, 0.1);
+		color: rgba(255, 255, 255, 0.85);
+		cursor: pointer;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		padding: 0;
+	}
+
+	.overlay-btn:hover {
+		background: rgba(255, 255, 255, 0.25);
+	}
+
+	.overlay-btn.active {
+		color: #f87171;
+	}
+
+	.overlay-btn.powered {
+		color: #4ade80;
+	}
+
+	.slider-wrap {
+		flex: 1;
+		width: 100%;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		overflow: hidden;
+		min-height: 0;
+	}
+
+	.vol-slider {
+		writing-mode: vertical-lr;
+		direction: rtl;
+		width: 32px;
+		height: 100%;
+		cursor: pointer;
+		accent-color: rgba(255, 255, 255, 0.85);
 	}
 </style>
