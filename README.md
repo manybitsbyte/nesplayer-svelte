@@ -13,8 +13,24 @@ npm install @manybitsbyte/nesplayer-svelte
 ```svelte
 <script>
   import { Screen } from '@manybitsbyte/nesplayer-svelte';
+</script>
 
-  let romBytes = $state(null);   // Uint8Array of a .nes file
+<Screen style="width: 512px; height: 480px;" />
+```
+
+That's it. The built-in controls overlay includes a file picker — hover the right edge of the player and click the disk icon to load a `.nes` ROM.
+
+The component fills its container. Set width/height on the element or a wrapping div. The canvas maintains the correct NES aspect ratio (8:7 pixel, ~1.167:1) and letter-boxes within the available space.
+
+### Loading a ROM programmatically
+
+If you want to serve ROMs from your own UI (a game library, a URL fetch, etc.), pass the bytes via the `rom` prop:
+
+```svelte
+<script>
+  import { Screen } from '@manybitsbyte/nesplayer-svelte';
+
+  let romBytes = $state(null);
 
   async function loadRom() {
     const res = await fetch('/roms/game.nes');
@@ -22,12 +38,9 @@ npm install @manybitsbyte/nesplayer-svelte
   }
 </script>
 
-<button onclick={loadRom}>Load ROM</button>
-
+<button onclick={loadRom}>Load game</button>
 <Screen rom={romBytes} romName="game" style="width: 512px; height: 480px;" />
 ```
-
-The component fills its container. Set width/height on the element or a wrapping div. The canvas maintains the correct NES aspect ratio (8:7 pixel, ~1.167:1) and letter-boxes within the available space.
 
 ## Props
 
