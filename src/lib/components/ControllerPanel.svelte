@@ -1,6 +1,6 @@
 <script lang="ts">
 	type GamepadInfo    = { id: string; index: number; name: string };
-	type GamepadProfile = { id: string; buttonMap: Record<number, number> };
+	type GamepadProfile = { id: string; buttonMap: Record<number, number>; quickSaveBtn?: number | null; quickLoadBtn?: number | null };
 	type PlayerInput    = { type: 'keyboard' } | { type: 'gamepad'; id: string } | { type: 'none' };
 
 	const NES_BUTTONS: Array<{ label: string; bit: number }> = [
@@ -65,6 +65,10 @@
 		player2Input:            PlayerInput;
 		player1KeyMap:           Record<string, number>;
 		player2KeyMap:           Record<string, number>;
+		quickSaveKey:            string;
+		quickLoadKey:            string;
+		onquicksavekeychange:    (key: string) => void;
+		onquickloadkeychange:    (key: string) => void;
 		onplayer1inputchange:    (v: PlayerInput) => void;
 		onplayer2inputchange:    (v: PlayerInput) => void;
 		onplayer1keymapchange:   (m: Record<string, number>) => void;
@@ -78,16 +82,17 @@
 		detectedGamepads, gamepadProfiles,
 		player1Input, player2Input,
 		player1KeyMap, player2KeyMap,
+		quickSaveKey, quickLoadKey,
+		onquicksavekeychange, onquickloadkeychange,
 		onplayer1inputchange, onplayer2inputchange,
 		onplayer1keymapchange, onplayer2keymapchange,
 		ongpprofilechange, onclose,
 	}: Props = $props();
 
-	// Keyboard rebinding: { player, bit }
-	let kbRebind = $state<{ player: 1 | 2; bit: number } | null>(null);
-
-	// Gamepad rebinding: { padId, bit }
-	let gpRebind = $state<{ padId: string; bit: number } | null>(null);
+	let kbRebind       = $state<{ player: 1 | 2; bit: number } | null>(null);
+	let gpRebind       = $state<{ padId: string; bit: number } | null>(null);
+	let stateKeyRebind = $state<'save' | 'load' | null>(null);
+	let stateGpRebind  = $state<{ padId: string; which: 'save' | 'load' } | null>(null);
 
 	function activeProfile(padId: string): GamepadProfile {
 		return gamepadProfiles.find(p => p.id === padId) ?? { id: padId, buttonMap: { ...defaultGamepadButtonMap } };
@@ -130,38 +135,98 @@
 		return () => { window.removeEventListener('keydown', handler, { capture: true }); };
 	});
 
-	// Gamepad rebind effect
+	$effect(() => {
+		if (!stateKeyRebind) { return; }
+		const which = stateKeyRebind;
+		const handler = (e: KeyboardEvent) => {
+			e.preventDefault();
+			e.stopImmediatePropagation();
+			if (e.code === 'Escape') { stateKeyRebind = null; return; }
+			if (which === 'save') { onquicksavekeychange(e.code); }
+			else                  { onquickloadkeychange(e.code); }
+			stateKeyRebind = null;
+		};
+		window.addEventListener('keydown', handler, { capture: true });
+		return () => { window.removeEventListener('keydown', handler, { capture: true }); };
+	});
+
 	$effect(() => {
 		if (!gpRebind) { return; }
 		const { padId, bit } = gpRebind;
-		const initial = new Set<number>();
-		for (const gp of navigator.getGamepads()) {
-			if (gp?.id === padId) {
-				gp.buttons.forEach((b, i) => { if (b.pressed) { initial.add(i); } });
-				break;
+
+		const initialGp = [...navigator.getGamepads()].find(p => p?.id === padId && p?.connected);
+		const initial   = new Set<number>();
+		if (initialGp) {
+			for (let i = 0; i < initialGp.buttons.length; i++) {
+				if (initialGp.buttons[i]?.pressed) { initial.add(i); }
 			}
 		}
-		let rafId: number;
+		let released = initial.size === 0;
+
 		function poll() {
-			const gp = [...navigator.getGamepads()].find(p => p?.id === padId) ?? null;
-			if (!gp) { gpRebind = null; return; }
+			const gp = [...navigator.getGamepads()].find(p => p?.id === padId && p?.connected) ?? null;
+			if (!gp) { return; }
+
+			if (!released) {
+				released = ![...initial].some(i => gp.buttons[i]?.pressed);
+				return;
+			}
+
 			for (let i = 0; i < gp.buttons.length; i++) {
-				if (gp.buttons[i]?.pressed && !initial.has(i)) {
-					const cur  = activeProfile(padId).buttonMap;
+				if (gp.buttons[i]?.pressed) {
+					const curProfile = activeProfile(padId);
 					const next: Record<number, number> = {};
-					for (const [k, v] of Object.entries(cur)) {
+					for (const [k, v] of Object.entries(curProfile.buttonMap)) {
 						if (v !== bit) { next[Number(k)] = v; }
 					}
 					next[i] = bit;
-					ongpprofilechange({ id: padId, buttonMap: next });
+					ongpprofilechange({ ...curProfile, buttonMap: next });
 					gpRebind = null;
 					return;
 				}
 			}
-			rafId = requestAnimationFrame(poll);
 		}
-		rafId = requestAnimationFrame(poll);
-		return () => { cancelAnimationFrame(rafId); };
+
+		const intervalId = setInterval(poll, 16);
+		return () => { clearInterval(intervalId); };
+	});
+
+	$effect(() => {
+		if (!stateGpRebind) { return; }
+		const { padId, which } = stateGpRebind;
+
+		const initialGp = [...navigator.getGamepads()].find(p => p?.id === padId && p?.connected);
+		const initial   = new Set<number>();
+		if (initialGp) {
+			for (let i = 0; i < initialGp.buttons.length; i++) {
+				if (initialGp.buttons[i]?.pressed) { initial.add(i); }
+			}
+		}
+		let released = initial.size === 0;
+
+		function poll() {
+			const gp = [...navigator.getGamepads()].find(p => p?.id === padId && p?.connected) ?? null;
+			if (!gp) { return; }
+			if (!released) {
+				released = ![...initial].some(i => gp.buttons[i]?.pressed);
+				return;
+			}
+			for (let i = 0; i < gp.buttons.length; i++) {
+				if (gp.buttons[i]?.pressed) {
+					const cur = activeProfile(padId);
+					if (which === 'save') {
+						ongpprofilechange({ ...cur, quickSaveBtn: i });
+					} else {
+						ongpprofilechange({ ...cur, quickLoadBtn: i });
+					}
+					stateGpRebind = null;
+					return;
+				}
+			}
+		}
+
+		const intervalId = setInterval(poll, 16);
+		return () => { clearInterval(intervalId); };
 	});
 </script>
 
@@ -317,6 +382,35 @@
 						</button>
 					</div>
 				{/each}
+				<div class="cp-divider"></div>
+				<div class="cp-row">
+					<span class="cp-btn-label">Quick Save</span>
+					<button
+						class="cp-key-tag"
+						class:rebinding={stateKeyRebind === 'save'}
+						onclick={() => { stateKeyRebind = stateKeyRebind === 'save' ? null : 'save'; kbRebind = null; }}
+					>
+						{#if stateKeyRebind === 'save'}
+							<span class="cp-listening">press key…</span>
+						{:else}
+							{keyLabel(quickSaveKey)}
+						{/if}
+					</button>
+				</div>
+				<div class="cp-row">
+					<span class="cp-btn-label">Quick Load</span>
+					<button
+						class="cp-key-tag"
+						class:rebinding={stateKeyRebind === 'load'}
+						onclick={() => { stateKeyRebind = stateKeyRebind === 'load' ? null : 'load'; kbRebind = null; }}
+					>
+						{#if stateKeyRebind === 'load'}
+							<span class="cp-listening">press key…</span>
+						{:else}
+							{keyLabel(quickLoadKey)}
+						{/if}
+					</button>
+				</div>
 				<button
 					class="cp-reset-btn"
 					onclick={() => {
@@ -348,11 +442,41 @@
 						</button>
 					</div>
 				{/each}
+				<div class="cp-divider"></div>
+				<div class="cp-row">
+					<span class="cp-btn-label">Quick Save</span>
+					<button
+						class="cp-key-tag"
+						class:rebinding={stateGpRebind?.padId === input.id && stateGpRebind?.which === 'save'}
+						onclick={() => { stateGpRebind = (stateGpRebind?.which === 'save' && stateGpRebind?.padId === input.id) ? null : { padId: input.id, which: 'save' }; gpRebind = null; }}
+					>
+						{#if stateGpRebind?.padId === input.id && stateGpRebind?.which === 'save'}
+							<span class="cp-listening">press button…</span>
+						{:else}
+							{prof.quickSaveBtn != null ? gpBtnLabel(prof.quickSaveBtn) : '—'}
+						{/if}
+					</button>
+				</div>
+				<div class="cp-row">
+					<span class="cp-btn-label">Quick Load</span>
+					<button
+						class="cp-key-tag"
+						class:rebinding={stateGpRebind?.padId === input.id && stateGpRebind?.which === 'load'}
+						onclick={() => { stateGpRebind = (stateGpRebind?.which === 'load' && stateGpRebind?.padId === input.id) ? null : { padId: input.id, which: 'load' }; gpRebind = null; }}
+					>
+						{#if stateGpRebind?.padId === input.id && stateGpRebind?.which === 'load'}
+							<span class="cp-listening">press button…</span>
+						{:else}
+							{prof.quickLoadBtn != null ? gpBtnLabel(prof.quickLoadBtn) : '—'}
+						{/if}
+					</button>
+				</div>
 				<button
 					class="cp-reset-btn"
 					onclick={() => {
-						ongpprofilechange({ id: input.id, buttonMap: { ...defaultGamepadButtonMap } });
+						ongpprofilechange({ id: input.id, buttonMap: { ...defaultGamepadButtonMap }, quickSaveBtn: null, quickLoadBtn: null });
 						gpRebind = null;
+						stateGpRebind = null;
 					}}
 				>Reset to defaults</button>
 			</div>
@@ -435,6 +559,12 @@
 		width: 100%;
 		max-width: 210px;
 		overflow: visible;
+	}
+
+	.cp-divider {
+		border: none;
+		border-top: 1px solid rgba(255, 255, 255, 0.07);
+		margin: 4px 0;
 	}
 
 	.cp-section {

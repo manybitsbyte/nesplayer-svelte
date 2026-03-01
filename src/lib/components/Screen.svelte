@@ -4,6 +4,7 @@
 	import createNESPlayerModule from '$lib/wasm/nes-player.js';
 	import nesPlayerWasmUrl from '$lib/wasm/nes-player.wasm?url';
 	import ControllerPanel from './ControllerPanel.svelte';
+	import { version } from '$lib/version.js';
 
 	interface NESModule {
 		HEAPU8:                Uint8Array;
@@ -38,6 +39,9 @@
 		_getCyclesPerFrame:    () => number;
 		_getRegion:            () => number;
 		_setRegion:            (region: number) => void;
+		_saveCPUState:         () => number;
+		_getStateBufPtr:       () => number;
+		_restoreCPUState:      (ptr: number, size: number) => void;
 	}
 
 	interface Props {
@@ -104,6 +108,8 @@
 		player1KeyMap:   Record<string, number>;
 		player2KeyMap:   Record<string, number>;
 		gamepadProfiles: GamepadProfile[];
+		quickSaveKey:    string;
+		quickLoadKey:    string;
 	};
 
 	let container  = $state<HTMLDivElement | undefined>();
@@ -143,7 +149,7 @@
 	let showControllerPanel = $state(false);
 
 	type GamepadInfo    = { id: string; index: number; name: string };
-	type GamepadProfile = { id: string; buttonMap: Record<number, number> };
+	type GamepadProfile = { id: string; buttonMap: Record<number, number>; quickSaveBtn?: number | null; quickLoadBtn?: number | null };
 	type PlayerInput    = { type: 'keyboard' } | { type: 'gamepad'; id: string } | { type: 'none' };
 
 	let detectedGamepads = $state<GamepadInfo[]>([]);
@@ -152,6 +158,14 @@
 	let player2Input     = $state<PlayerInput>({ type: 'none' });
 	let player1KeyMap    = $state<Record<string, number>>({ ...DEFAULT_KEYMAP });
 	let player2KeyMap    = $state<Record<string, number>>({});
+	let quickSaveKey     = $state('F5');
+	let quickLoadKey     = $state('F7');
+
+	let quickSaveState    = $state<Uint8Array | null>(null);
+	let stateMessage      = $state<string | null>(null);
+	let stateMessageTimer = 0;
+	let gpQsSavePrev: Record<string, boolean> = {};
+	let gpQsLoadPrev: Record<string, boolean> = {};
 
 	type DisconnectWarning = { padId: string; padName: string; player: 1 | 2 };
 	let disconnectWarning        = $state<DisconnectWarning | null>(null);
@@ -187,6 +201,8 @@
 			if (cfg.player1KeyMap)   { player1KeyMap   = cfg.player1KeyMap; }
 			if (cfg.player2KeyMap)   { player2KeyMap   = cfg.player2KeyMap; }
 			if (cfg.gamepadProfiles) { gamepadProfiles = cfg.gamepadProfiles; }
+			if (cfg.quickSaveKey)    { quickSaveKey    = cfg.quickSaveKey; }
+			if (cfg.quickLoadKey)    { quickLoadKey    = cfg.quickLoadKey; }
 		} catch { }
 	}
 
@@ -215,6 +231,37 @@
 		waitingReconnect     = null;
 		disconnectAutoPaused = false;
 		onPower();
+	}
+
+	function showStateMessage(msg: string) {
+		stateMessage = msg;
+		clearTimeout(stateMessageTimer);
+		stateMessageTimer = window.setTimeout(() => { stateMessage = null; }, 1500);
+	}
+
+	function quickSave() {
+		if (!nes || !powered) { return; }
+		const size     = nes._saveCPUState();
+		const ptr      = nes._getStateBufPtr();
+		quickSaveState = nes.HEAPU8.slice(ptr, ptr + size);
+		if (currentRomName) {
+			localStorage.setItem(`nesplayer-${currentRomName}.state`, bytesToBase64(quickSaveState));
+		}
+		showStateMessage('State saved');
+	}
+
+	function quickLoad() {
+		if (!nes || !powered || !quickSaveState) { return; }
+		const ptr = nes._malloc(quickSaveState.length);
+		nes.HEAPU8.set(quickSaveState, ptr);
+		nes._restoreCPUState(ptr, quickSaveState.length);
+		nes._free(ptr);
+		nes._resume();
+		paused     = false;
+		autoPaused = false;
+		lastTime   = 0;
+		cycleAccum = 0;
+		showStateMessage('State loaded');
 	}
 
 	function onContainerFocusIn() {
@@ -309,6 +356,15 @@
 		return copy;
 	}
 
+	function bytesToBase64(data: Uint8Array): string {
+		let str = '';
+		const CHUNK = 0x8000;
+		for (let i = 0; i < data.length; i += CHUNK) {
+			str += String.fromCharCode(...data.subarray(i, i + CHUNK));
+		}
+		return btoa(str);
+	}
+
 	function restoreSaves(module: NESModule) {
 		const sramSave = localStorage.getItem(`nesplayer-${currentRomName}.sram`);
 		if (sramSave && module._hasBattery()) {
@@ -323,6 +379,8 @@
 				module.HEAPU8.set(bytes, ptr);
 			}
 		}
+		const stateSave = localStorage.getItem(`nesplayer-${currentRomName}.state`);
+		quickSaveState  = stateSave ? Uint8Array.from(atob(stateSave), c => c.charCodeAt(0)) : null;
 	}
 
 	function flushSRAM(module: NESModule) {
@@ -552,6 +610,25 @@
 		module._setButtons(0, pollPlayer(player1Input, player1KeyMap));
 		module._setButtons(1, pollPlayer(player2Input, player2KeyMap));
 
+		for (const inp of [player1Input, player2Input]) {
+			if (inp.type !== 'gamepad') { continue; }
+			const pad  = livePads.find(p => p?.connected && p.id === inp.id) ?? null;
+			if (!pad) { continue; }
+			const prof     = gamepadProfiles.find(p => p.id === inp.id);
+			const saveBtn  = prof?.quickSaveBtn ?? null;
+			const loadBtn  = prof?.quickLoadBtn ?? null;
+			if (saveBtn !== null && saveBtn !== undefined) {
+				const now = pad.buttons[saveBtn]?.pressed ?? false;
+				if (now && !gpQsSavePrev[inp.id]) { quickSave(); }
+				gpQsSavePrev[inp.id] = now;
+			}
+			if (loadBtn !== null && loadBtn !== undefined) {
+				const now = pad.buttons[loadBtn]?.pressed ?? false;
+				if (now && !gpQsLoadPrev[inp.id]) { quickLoad(); }
+				gpQsLoadPrev[inp.id] = now;
+			}
+		}
+
 		if (module._isPaused()) {
 			lastTime   = 0;
 			cycleAccum = 0;
@@ -637,6 +714,7 @@
 		if (!configLoaded) { return; }
 		localStorage.setItem(INPUT_CONFIG_KEY, JSON.stringify({
 			player1Input, player2Input, player1KeyMap, player2KeyMap, gamepadProfiles,
+			quickSaveKey, quickLoadKey,
 		}));
 	});
 
@@ -782,6 +860,8 @@
 		const onKeyDown = (e: KeyboardEvent) => {
 			const tag = (e.target as HTMLElement)?.tagName;
 			if (tag === 'INPUT' || tag === 'TEXTAREA') { return; }
+			if (e.code === quickSaveKey) { e.preventDefault(); quickSave(); return; }
+			if (e.code === quickLoadKey) { e.preventDefault(); quickLoad(); return; }
 			if (showControllerPanel) { return; }
 			held.add(e.code);
 			if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.code)) {
@@ -1008,8 +1088,8 @@
 
 			<button class="overlay-btn" data-tip="Insert ROM" onclick={onInsertRomClick}>
 				<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-					<path d="M4 2h16a2 2 0 0 1 2 2v10h-5v6h-10v-6H2V4a2 2 0 0 1 2-2z"/>
-					<rect x="5" y="5" width="14" height="6" rx="1"/>
+					<path d="M4 2H20Q22 2 22 4V15H19V21Q19 22 18 22H6Q5 22 5 21V15H2V4Q2 2 4 2Z"/>
+					<rect x="6" y="5" width="12" height="6" rx="1"/>
 				</svg>
 			</button>
 			<input bind:this={fileInput} type="file" accept=".nes" style="display:none" onchange={onFileChange} />
@@ -1085,6 +1165,23 @@
 		</div>
 	{/if}
 
+	{#if stateMessage}
+		<div
+			class="state-toast"
+			style="top: {overlayTop + overlayH - 40}px; left: {overlayLeft}px; width: {overlayW}px;"
+		>
+			{stateMessage}
+		</div>
+	{/if}
+
+	<div
+		class="version-badge"
+		class:visible={showOverlay}
+		style="top: {overlayTop + overlayH - 24}px; left: {overlayLeft + 8}px;"
+	>
+		NES Player v{version}
+	</div>
+
 	{#if showControllerPanel}
 		<ControllerPanel
 			defaultKeyMap={DEFAULT_KEYMAP}
@@ -1095,6 +1192,10 @@
 			{player2Input}
 			{player1KeyMap}
 			{player2KeyMap}
+			{quickSaveKey}
+			{quickLoadKey}
+			onquicksavekeychange={(k) => { quickSaveKey = k; }}
+			onquickloadkeychange={(k) => { quickLoadKey = k; }}
 			onplayer1inputchange={(v) => { player1Input = v; }}
 			onplayer2inputchange={(v) => { player2Input = v; }}
 			onplayer1keymapchange={(m) => { player1KeyMap = m; }}
@@ -1239,6 +1340,50 @@
 		height: 100%;
 		cursor: pointer;
 		accent-color: rgba(255, 255, 255, 0.85);
+	}
+
+	.state-toast {
+		position: absolute;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		height: 32px;
+		background: rgba(0, 0, 0, 0.72);
+		color: rgba(255, 255, 255, 0.88);
+		font-size: 0.72rem;
+		font-weight: 600;
+		letter-spacing: 0.08em;
+		pointer-events: none;
+		z-index: 10;
+		animation: toast-fade 1.5s ease forwards;
+	}
+
+	@keyframes toast-fade {
+		0%   { opacity: 1; }
+		60%  { opacity: 1; }
+		100% { opacity: 0; }
+	}
+
+	.version-badge {
+		position: absolute;
+		height: 20px;
+		padding: 0 8px;
+		display: flex;
+		align-items: center;
+		background: rgba(0, 0, 0, 0.5);
+		color: rgba(255, 255, 255, 0.38);
+		font-size: 0.6rem;
+		font-weight: 600;
+		letter-spacing: 0.07em;
+		border-radius: 4px;
+		pointer-events: none;
+		z-index: 10;
+		opacity: 0;
+		transition: opacity 0.18s ease;
+	}
+
+	.version-badge.visible {
+		opacity: 1;
 	}
 
 	.dc-backdrop {
