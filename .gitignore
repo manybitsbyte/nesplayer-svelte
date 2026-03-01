@@ -1,5 +1,8 @@
 node_modules
 
+# Pack
+*.tgz
+
 # Output
 .output
 .vercel

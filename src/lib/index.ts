@@ -1,1 +1,1 @@
-// Reexport your entry components here
+export { default as Screen } from './components/Screen.svelte';

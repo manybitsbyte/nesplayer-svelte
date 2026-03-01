@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PKG="$DIR/package.json"
+VER="$DIR/src/lib/version.js"
+
+current=$(node -p "require('$PKG').version")
+IFS='.' read -r X Y Z <<< "$current"
+
+usage() {
+  echo "Usage:"
+  echo "  pkg-build X Y Z          positional (number, _ to keep, + to increment)"
+  echo "  pkg-build _ + _          increment minor only"
+  echo "  pkg-build x=N            set major to N"
+  echo "  pkg-build y=N            set minor to N"
+  echo "  pkg-build z=N            set patch to N"
+  echo "  pkg-build ++x            increment major"
+  echo "  pkg-build ++y            increment minor"
+  echo "  pkg-build ++z            increment patch"
+  echo ""
+  echo "  Aliases: major/minor/patch accepted in place of x/y/z"
+  echo "  Current: $current"
+}
+
+slot() {
+  case "$1" in
+    _)          echo "$2" ;;
+    +)          echo $(( $2 + 1 )) ;;
+    [0-9]*)     echo "$1" ;;
+    *)          echo "Invalid slot value: $1" >&2; exit 1 ;;
+  esac
+}
+
+if [[ $# -eq 3 ]]; then
+  X=$(slot "$1" "$X")
+  Y=$(slot "$2" "$Y")
+  Z=$(slot "$3" "$Z")
+elif [[ $# -eq 1 ]]; then
+  a="$1"
+  if   [[ $a =~ ^\+\+(x|major)$ ]];       then X=$(( X + 1 ))
+  elif [[ $a =~ ^\+\+(y|minor)$ ]];       then Y=$(( Y + 1 ))
+  elif [[ $a =~ ^\+\+(z|patch)$ ]];       then Z=$(( Z + 1 ))
+  elif [[ $a =~ ^(x|major)=([0-9]+)$ ]];  then X="${BASH_REMATCH[2]}"
+  elif [[ $a =~ ^(y|minor)=([0-9]+)$ ]];  then Y="${BASH_REMATCH[2]}"
+  elif [[ $a =~ ^(z|patch)=([0-9]+)$ ]];  then Z="${BASH_REMATCH[2]}"
+  else usage; exit 1; fi
+else
+  usage; exit 1
+fi
+
+V="$X.$Y.$Z"
+echo "version: $current → $V"
+
+node -e "
+  const fs = require('fs');
+  const p = JSON.parse(fs.readFileSync('$PKG', 'utf8'));
+  p.version = '$V';
+  fs.writeFileSync('$PKG', JSON.stringify(p, null, '\t') + '\n');
+"
+
+echo "export const version = '$V';" > "$VER"
+
+cd "$DIR"
+npm install
+npm run prepack
+npm pack
+
+echo "done: nesplayer-svelte-$V.tgz"

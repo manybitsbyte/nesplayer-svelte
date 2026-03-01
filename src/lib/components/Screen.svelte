@@ -3,6 +3,7 @@
 	import { SvelteSet } from 'svelte/reactivity';
 	import createNESPlayerModule from '$lib/wasm/nes-player.js';
 	import nesPlayerWasmUrl from '$lib/wasm/nes-player.wasm?url';
+	import audioWorkletSrc from '$lib/wasm/audio-worklet.js?raw';
 	import ControllerPanel from './ControllerPanel.svelte';
 	import { version } from '$lib/version.js';
 
@@ -489,7 +490,10 @@
 		console.log('[NESScreen] AudioContext state:', audioCtx.state, 'sampleRate:', audioCtx.sampleRate);
 		void audioCtx.resume();
 
-		await audioCtx.audioWorklet.addModule('/audio-worklet.js');
+		const workletBlob = new Blob([audioWorkletSrc], { type: 'text/javascript' });
+		const workletUrl  = URL.createObjectURL(workletBlob);
+		await audioCtx.audioWorklet.addModule(workletUrl);
+		URL.revokeObjectURL(workletUrl);
 
 		const workletNode = new AudioWorkletNode(audioCtx, 'nes-audio-processor', {
 			numberOfInputs:     0,
@@ -1088,8 +1092,9 @@
 
 			<button class="overlay-btn" data-tip="Insert ROM" onclick={onInsertRomClick}>
 				<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-					<path d="M4 2H20Q22 2 22 4V15H19V21Q19 22 18 22H6Q5 22 5 21V15H2V4Q2 2 4 2Z"/>
-					<rect x="6" y="5" width="12" height="6" rx="1"/>
+					<path d="M4 3H20V19H18V21H6V19H4Z"/>
+					<path d="M6 3V12H18V3"/>
+					<line x1="6" y1="6" x2="18" y2="6"/>
 				</svg>
 			</button>
 			<input bind:this={fileInput} type="file" accept=".nes" style="display:none" onchange={onFileChange} />
@@ -1179,7 +1184,7 @@
 		class:visible={showOverlay}
 		style="top: {overlayTop + overlayH - 24}px; left: {overlayLeft + 8}px;"
 	>
-		NES Player v{version}
+		NES Player (Svelte) v{version}
 	</div>
 
 	{#if showControllerPanel}
