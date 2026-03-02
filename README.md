@@ -104,7 +104,7 @@ The state is stored under the key `nesplayer-<romName>.state`, where `romName` i
 
 ### Battery save (SRAM)
 
-ROMs with battery-backed RAM (e.g. Zelda, Metroid) automatically save SRAM to `localStorage` on page unload and restore it when the same ROM is loaded again. Keys used:
+ROMs with battery-backed RAM (e.g. Zelda, Crystalis) automatically save SRAM to `localStorage` on page unload and restore it when the same ROM is loaded again. Keys used:
 
 | Key | Contents |
 |-----|----------|
@@ -148,7 +148,13 @@ Cross-Origin-Embedder-Policy: require-corp
 
 Without these headers the component still works — the screen renders and input is accepted — but audio is silently disabled and a warning is logged to the console.
 
-**SvelteKit / Vite dev server** — add to `vite.config.ts`:
+> **Note:** These headers restrict how your page can interact with cross-origin resources (iframes, popups, etc.). If your site relies on OAuth redirects, embedded third-party iframes, or similar cross-origin communication, audit the impact before enabling them.
+
+---
+
+#### `adapter-static` — Vite dev server
+
+Add to `vite.config.ts`:
 
 ```ts
 server: {
@@ -159,7 +165,9 @@ server: {
 },
 ```
 
-**Netlify** — add to `netlify.toml`:
+#### `adapter-static` — Netlify
+
+Add to `netlify.toml`:
 
 ```toml
 [[headers]]
@@ -169,7 +177,9 @@ server: {
     Cross-Origin-Embedder-Policy = "require-corp"
 ```
 
-**Vercel** — add to `vercel.json`:
+#### `adapter-static` — Vercel
+
+Add to `vercel.json`:
 
 ```json
 {
@@ -185,7 +195,32 @@ server: {
 }
 ```
 
-> **Note:** These headers restrict how your page can interact with cross-origin resources (iframes, popups, etc.). If your site relies on OAuth redirects, embedded third-party iframes, or similar cross-origin communication, audit the impact before enabling them.
+#### `adapter-node`
+
+Set the headers in `src/hooks.server.ts`. This covers every HTML page response and is the only change needed for production:
+
+```ts
+import type { Handle } from '@sveltejs/kit';
+
+export const handle: Handle = async ({ event, resolve }) => {
+    const response = await resolve(event);
+    response.headers.set('Cross-Origin-Opener-Policy', 'same-origin');
+    response.headers.set('Cross-Origin-Embedder-Policy', 'require-corp');
+    return response;
+};
+```
+
+For the dev server, also add the `server.headers` block to `vite.config.ts` as shown in the static section above.
+
+If you offload static assets to a CDN, the CDN-hosted `.js` and `.wasm` files must also send:
+
+```
+Cross-Origin-Resource-Policy: cross-origin
+```
+
+Without it, COEP will block those assets from loading. If you serve statics from the same Node origin (the default), no extra config is needed.
+
+If you use a reverse proxy (nginx, Caddy, etc.), make sure it is configured to pass response headers through unchanged.
 
 ### WebGL
 

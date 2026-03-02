@@ -2,8 +2,7 @@
 	import { onMount } from 'svelte';
 	import { SvelteSet } from 'svelte/reactivity';
 	import createNESPlayerModule from '$lib/wasm/nes-player.js';
-	import nesPlayerWasmUrl from '$lib/wasm/nes-player.wasm?url';
-	import audioWorkletSrc from '$lib/wasm/audio-worklet.js?raw';
+	import { audioWorkletSrc } from '$lib/wasm/audio-worklet-src.js';
 	import ControllerPanel from './ControllerPanel.svelte';
 	import { version } from '$lib/version.js';
 
@@ -967,9 +966,7 @@
 		window.addEventListener('gamepaddisconnected', onGamepadDisconnected);
 
 		void (async () => {
-			const module  = await createNESPlayerModule({
-				locateFile: (f: string) => f.endsWith('.wasm') ? nesPlayerWasmUrl : f,
-			}) as NESModule;
+			const module  = await createNESPlayerModule({}) as NESModule;
 			module._init();
 			module._powerOn();
 			await initAudio(module);
